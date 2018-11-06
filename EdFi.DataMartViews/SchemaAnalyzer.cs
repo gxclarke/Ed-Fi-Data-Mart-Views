@@ -69,12 +69,18 @@ namespace EdFi.DataMartViews
             }
         }
 
+        public class ForeignKeyColumn
+        {
+            public ColumnDefinition Column { get; set; }
+            public ColumnDefinition PrimaryKeyColumn { get; set; }
+        }
+
         public class ForeignKeyRelationship
         {
             public string ConstraintName { get; set; }
             public string PrimaryKeyTable { get; set; }
-            public List<ColumnDefinition> Columns { get; set; }
-            public List<ColumnDefinition> PrimaryKeyColumns { get; set; }
+            public string PrimaryKeyCorrelationName { get; set; }
+            public List<ForeignKeyColumn> RelationshipColumns { get; set; }
         }
 
         public List<ForeignKeyRelationship> GetForeignKeyRelationships(string tableName)
@@ -97,13 +103,22 @@ namespace EdFi.DataMartViews
                     {
                         ConstraintName = foreignKeyConstraint.ConstraintName,
                         PrimaryKeyTable = primaryKeyConstraint.TableName,
-                        Columns = columns,
-                        PrimaryKeyColumns = primaryKeyColumns
+                        PrimaryKeyCorrelationName = GetConventionBasedCorrelationName(foreignKeyConstraint.ConstraintName),
+                        RelationshipColumns = columns.Zip(primaryKeyColumns, (c, pkc) => new ForeignKeyColumn {  Column = c, PrimaryKeyColumn = pkc }).ToList()
                     });
                 }
             }
 
             return relationships;
+        }
+
+        private string GetConventionBasedCorrelationName(string constraintName)
+        {
+            string[] parts = constraintName.Split('_');
+            if (parts.Length == 3)
+                return parts[2].Replace("Id", "");
+            else
+                return parts[2];
         }
 
         private void FixRelationshipColumnOrder(ReferentialConstraint referentialConstraint, ref List<ColumnDefinition> columns, ref List<ColumnDefinition> primaryKeyColumns)
@@ -120,7 +135,7 @@ namespace EdFi.DataMartViews
 
             columns = columns.OrderBy(_ => dataRows.Select(dr => dr["ColumnName"]).ToList().IndexOf(_.ColumnName)).ToList();
 
-            primaryKeyColumns = columns.OrderBy(_ => dataRows.Select(dr => dr["ReferencedColumnName"]).ToList().IndexOf(_.ColumnName)).ToList();
+            primaryKeyColumns = primaryKeyColumns.OrderBy(_ => dataRows.Select(dr => dr["ReferencedColumnName"]).ToList().IndexOf(_.ColumnName)).ToList();
         }
 
         public bool ViewExists(string viewName)
