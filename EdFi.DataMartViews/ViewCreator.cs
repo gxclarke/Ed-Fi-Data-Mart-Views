@@ -7,7 +7,6 @@ using System.Text;
 namespace EdFi.DataMartViews
 {
     //TODO: How to identify a junk table
-    //TODO: Create indexed views
     public class ViewCreator
     {
         string _connectionString;
@@ -38,8 +37,10 @@ namespace EdFi.DataMartViews
         {
             string columnName = ToQualified(schema, tableName, column.ColumnName);
 
-            if (column.DataType != "nvarchar")
-                columnName = $"CAST({ columnName} AS NVARCHAR(30))";
+            if (column.DataType == "date")
+                columnName = $"CONVERT(NVARCHAR(8), {columnName}, 112)";
+            else if (column.DataType != "nvarchar")
+                columnName = $"CAST({columnName} AS NVARCHAR(30))";
 
             return columnName;
         }
@@ -85,9 +86,18 @@ namespace EdFi.DataMartViews
             return name;
         }
 
-        private string GetCreateViewStatement(string viewName, string sql)
+        private void CreateView(string viewName, string sql)
         {
-            return $"CREATE VIEW [{_viewSchema}].[{viewName}] WITH SCHEMABINDING AS\n{sql} ;";
+            string statement =  $"CREATE VIEW {ToQualified(_viewSchema, viewName)} WITH SCHEMABINDING AS\n{sql};";
+            SqlUtil.ExecuteCommand(_connectionString, statement);
+        }
+
+
+        private void CreateClusteredIndex(string viewName, string primaryKeyColumnName)
+        {
+            return; // This won't work because most of our views contain left joins.
+            string statement = $"CREATE UNIQUE CLUSTERED INDEX CX_{viewName} ON {ToQualified(_viewSchema, viewName)} ([{primaryKeyColumnName}]);";
+            SqlUtil.ExecuteCommand(_connectionString, statement);
         }
 
         //TODO: Handle bridge table requirement
@@ -96,9 +106,13 @@ namespace EdFi.DataMartViews
         /// In this case a bridge table has to be created. THe bridge table is a factless-fact table. It serves only
         /// to count each student assessment.
         /// </summary>
-        private string GetFactSql(string tableName)
+        private void CreateFactTableView(string tableName)
         {
-            var primaryKeyClause = GetViewKeyDefinition(_schema, tableName, _analyzer.GetPrimaryKeyColumns(tableName)) + " AS [" + tableName + "Key]";
+            var primaryKeyColumns = _analyzer.GetPrimaryKeyColumns(tableName);
+
+            string primaryKeyColumnName = tableName + "Key";
+
+            string primaryKeyClause = GetViewKeyDefinition(_schema, tableName, primaryKeyColumns) + " AS [" + primaryKeyColumnName + "]";
 
             var relationships = _analyzer.GetForeignKeyRelationships(tableName);
 
@@ -115,15 +129,25 @@ namespace EdFi.DataMartViews
             viewColumns.AddRange(foreignKeyClauses);
             viewColumns.AddRange(_analyzer.GetNonKeyColumns(tableName).Select(_ => ToQualified(_schema, tableName, _)));
 
-            return "SELECT"
+            string sql = "SELECT"
                 + string.Join(", ", viewColumns.Select(_ => $"\n\t{_}"))
                 + $"\nFROM [{_schema}].[{tableName}]"
                 + string.Join("", relationships.Select(_ => $"\n{GetRelationshipJoin(tableName, _)}"));
+
+            string viewName = "Fact" + tableName;
+
+            CreateView(viewName, sql);
+            CreateClusteredIndex(viewName, primaryKeyColumnName);
         }
 
-        private string GetLookupSql(string tableName)
+        private void CreateLookupView(string tableName)
         {
             bool isDescriptor = tableName.EndsWith("Descriptor");
+
+            string viewName = $"Lkp{tableName.Replace(isDescriptor ? "Descriptor" : "Type", "")}";
+
+            if (_analyzer.ViewExists(viewName))
+                return;
 
             string primaryKeyName = isDescriptor ? tableName.Replace("Descriptor", "Key") : tableName.Replace("Type", "Key");
 
@@ -151,26 +175,37 @@ namespace EdFi.DataMartViews
                 sb.Append($"\n\tJOIN [{_schema}].[{typeTableName}] ON\n\t\t[{_schema}].[{tableName}].[{typeTableName}Id] = [{_schema}].[{typeTableName}].[{typeTableName}Id]");
             }
 
-            return sb.ToString();   
+            string sql = sb.ToString();
+
+            CreateView(viewName, sql);
         }
 
-        private string GetDimensionSql(string tableName)
+        private void CreateDimensionView(string tableName)
         {
-            var primaryKeyClause = GetViewKeyDefinition(_schema, tableName, _analyzer.GetPrimaryKeyColumns(tableName)) + " AS [" + tableName + "Key]";
+            var primaryKeyColumns = _analyzer.GetPrimaryKeyColumns(tableName);
+
+            string primaryKeyColumnName = tableName + "Key";
+
+            string primaryKeyClause = GetViewKeyDefinition(_schema, tableName, primaryKeyColumns) + " AS [" + primaryKeyColumnName + "]";
 
             var relationships = _analyzer.GetForeignKeyRelationships(tableName);
 
-            var foreignKeyClauses = relationships.SelectMany(r => r.RelationshipColumns.Select(c => ToQualified(null, r.PrimaryKeyCorrelationName, c.PrimaryKeyColumn.ColumnName) + " AS [" /*+ r.PrimaryKeyTable*/ + c.Column.ColumnName + "]"));
+            var foreignKeyClauses = relationships.SelectMany(r => r.RelationshipColumns.Select(c => ToQualified(null, r.PrimaryKeyCorrelationName, c.PrimaryKeyColumn.ColumnName) + " AS [" + c.Column.ColumnName + "]"));
 
             var viewColumns = new List<string>();
             viewColumns.Add(primaryKeyClause);
             viewColumns.AddRange(foreignKeyClauses);
             viewColumns.AddRange(_analyzer.GetNonKeyColumns(tableName).Select(_ => ToQualified(_schema, tableName, _)));
 
-            return "SELECT"
+            string sql = "SELECT"
                 + string.Join(", ", viewColumns.Select(_ => $"\n\t{_}"))
                 + $"\nFROM [{_schema}].[{tableName}]"
                 + string.Join("", relationships.Select(_ => $"\n{GetRelationshipJoin(tableName, _)}"));
+
+            string viewName = "Dim" + tableName;
+
+            CreateView(viewName, sql);
+            CreateClusteredIndex(viewName, primaryKeyColumnName);
         }
 
         public void ProcessFactTable(string tableName)
@@ -181,9 +216,7 @@ namespace EdFi.DataMartViews
             _dependentTables = new HashSet<string>();
 
             using (var context = GetContext())
-            {
-                SqlUtil.ExecuteCommand(_connectionString, GetCreateViewStatement("Fact" + tableName, GetFactSql(tableName)));
-            }
+                CreateFactTableView(tableName);
 
             foreach (string dependentTable in _dependentTables)
                 ProcessDimension(dependentTable);
@@ -193,24 +226,10 @@ namespace EdFi.DataMartViews
         //TODO: Multiple dimension tables may be created from a dependent table. See The Assessment dimension for an example
         private void ProcessDimension(string dependentTable)
         {
-            using (var context = GetContext())
-            {
-                bool isDescriptor = dependentTable.EndsWith("Descriptor");
-                bool isType = dependentTable.EndsWith("Type");
-
-                if (isDescriptor || isType)
-                {
-                    string viewName = $"Lkp{dependentTable.Replace(isDescriptor ? "Descriptor" : "Type", "")}";
-                    if (!_analyzer.ViewExists(viewName))
-                    {
-                        SqlUtil.ExecuteCommand(_connectionString, GetCreateViewStatement(viewName, GetLookupSql(dependentTable)));
-                    }
-                }
-                else
-                {
-                    SqlUtil.ExecuteCommand(_connectionString, GetCreateViewStatement("Dim" + dependentTable, GetDimensionSql(dependentTable)));
-                }
-            }
+            if (dependentTable.EndsWith("Descriptor") || dependentTable.EndsWith("Type"))
+                CreateLookupView(dependentTable);
+            else
+                CreateDimensionView(dependentTable);
         }
     }
 }
