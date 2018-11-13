@@ -6,20 +6,23 @@ using System.Text;
 
 namespace EdFi.DataMartViews
 {
-    //TODO: How to identify a junk table
     public class ViewCreator
     {
         string _connectionString;
         string _schema;
         string _viewSchema;
+        string _lookupSchema;
         SchemaAnalyzer _analyzer;
-        HashSet<string> _dependentTables;
+        HashSet<string> _factDependentTables;
+        HashSet<string> _dimensionDependentTables;
 
-        public ViewCreator(string connectionString, string schema, string viewSchema)
+        public ViewCreator(string connectionString, string schema, string viewSchema, string lookupSchema = null)
         {
             _connectionString = connectionString;
             _schema = schema;
-            _viewSchema = viewSchema;
+             _viewSchema = viewSchema;
+            _lookupSchema = lookupSchema ?? viewSchema;
+
             _analyzer = new SchemaAnalyzer(connectionString, schema);
         }
 
@@ -33,7 +36,7 @@ namespace EdFi.DataMartViews
             return $"{(schema != null ? "[" + schema + "]." : "")}[{tableName}]" + (columnName != null ? $".[{columnName}]" : "");
         }
 
-        private string CastAndQualifyKeyColumn(string schema, string tableName, SchemaAnalyzer.ColumnDefinition column)
+        private string CastAndQualifySurrogateKeyColumn(string schema, string tableName, SchemaAnalyzer.ColumnDefinition column)
         {
             string columnName = ToQualified(schema, tableName, column.ColumnName);
 
@@ -45,9 +48,9 @@ namespace EdFi.DataMartViews
             return columnName;
         }
 
-        private string GetViewKeyDefinition(string schema, string tableName, IEnumerable<SchemaAnalyzer.ColumnDefinition> columns)
+        private string GetSurrogateKeyDefinition(string schema, string tableName, IEnumerable<SchemaAnalyzer.ColumnDefinition> columns)
         {
-            return string.Join("\n\t\t+ '_' + ", columns.Select(_ => CastAndQualifyKeyColumn(schema, tableName, _)));
+            return string.Join("\n\t\t+ '_' + ", columns.Select(_ => CastAndQualifySurrogateKeyColumn(schema, tableName, _)));
         }
 
         private string GetRelationshipJoin(string tableName, SchemaAnalyzer.ForeignKeyRelationship relationship)
@@ -73,25 +76,29 @@ namespace EdFi.DataMartViews
             return relationship.PrimaryKeyTable;
         }
 
-        private string ApplyLookupQualifier(string name)
+        private string ApplyLookupColumnQualifier(string columnName)
         {
-            bool isType = name.EndsWith("Type");
-            bool isDescriptor = name.EndsWith("Descriptor");
+            bool isColumn = columnName.EndsWith("Id");
+
+            string typeSuffix = "Type" + (isColumn ? "Id" : "");
+            string descriptorSuffix = "Descriptor" + (isColumn ? "Id" : "");
+
+            bool isType = columnName.EndsWith(typeSuffix);
+            bool isDescriptor = columnName.EndsWith(descriptorSuffix);
 
             if (isType || isDescriptor)
             {
-                name = name.Replace(isType ? "Type" : "Descriptor", "") + "Lookup";
+                columnName = columnName.Replace(isType ? typeSuffix : descriptorSuffix, "") + "Lookup";
             }
 
-            return name;
+            return columnName;
         }
 
-        private void CreateView(string viewName, string sql)
+        private void CreateView(string schema, string viewName, string sql)
         {
-            string statement =  $"CREATE VIEW {ToQualified(_viewSchema, viewName)} WITH SCHEMABINDING AS\n{sql};";
+            string statement =  $"CREATE VIEW {ToQualified(schema, viewName)} WITH SCHEMABINDING AS\n{sql};";
             SqlUtil.ExecuteCommand(_connectionString, statement);
         }
-
 
         private void CreateClusteredIndex(string viewName, string primaryKeyColumnName)
         {
@@ -100,33 +107,28 @@ namespace EdFi.DataMartViews
             SqlUtil.ExecuteCommand(_connectionString, statement);
         }
 
-        //TODO: Handle bridge table requirement
-        /// <summary>
-        /// A student can take the same assessment more than once. This is identified by a PK column that is not a FK.
-        /// In this case a bridge table has to be created. THe bridge table is a factless-fact table. It serves only
-        /// to count each student assessment.
-        /// </summary>
         private void CreateFactTableView(string tableName)
         {
             var primaryKeyColumns = _analyzer.GetPrimaryKeyColumns(tableName);
 
             string primaryKeyColumnName = tableName + "Key";
 
-            string primaryKeyClause = GetViewKeyDefinition(_schema, tableName, primaryKeyColumns) + " AS [" + primaryKeyColumnName + "]";
+            string primaryKeyColumnClause = GetSurrogateKeyDefinition(_schema, tableName, primaryKeyColumns) + " AS [" + primaryKeyColumnName + "]";
 
             var relationships = _analyzer.GetForeignKeyRelationships(tableName);
 
-            var foreignKeyClauses = relationships.Select(_ => GetViewKeyDefinition(null, _.PrimaryKeyCorrelationName, _.RelationshipColumns.Select(c => c.PrimaryKeyColumn)) + " AS [" + ApplyLookupQualifier(GetConventionBasedRelationshipName(_)) + "Key]");
+            var foreignKeyColumnClauses = relationships.Select(_ => GetSurrogateKeyDefinition(null, _.PrimaryKeyCorrelationName, 
+                _.RelationshipColumns.Select(c => c.PrimaryKeyColumn)) + " AS [" + ApplyLookupColumnQualifier(GetConventionBasedRelationshipName(_)) + "Key]");
 
             foreach (var relationship in relationships)
             {
-                if (!_dependentTables.Contains(relationship.PrimaryKeyTable))
-                    _dependentTables.Add(relationship.PrimaryKeyTable);
+                if (!_factDependentTables.Contains(relationship.PrimaryKeyTable))
+                    _factDependentTables.Add(relationship.PrimaryKeyTable);
             }
 
             var viewColumns = new List<string>();
-            viewColumns.Add(primaryKeyClause);
-            viewColumns.AddRange(foreignKeyClauses);
+            viewColumns.Add(primaryKeyColumnClause);
+            viewColumns.AddRange(foreignKeyColumnClauses);
             viewColumns.AddRange(_analyzer.GetNonKeyColumns(tableName).Select(_ => ToQualified(_schema, tableName, _)));
 
             string sql = "SELECT"
@@ -136,75 +138,67 @@ namespace EdFi.DataMartViews
 
             string viewName = "Fact" + tableName;
 
-            CreateView(viewName, sql);
+            CreateView(_viewSchema, viewName, sql);
             CreateClusteredIndex(viewName, primaryKeyColumnName);
-        }
-
-        private void CreateLookupView(string tableName)
-        {
-            bool isDescriptor = tableName.EndsWith("Descriptor");
-
-            string viewName = $"Lkp{tableName.Replace(isDescriptor ? "Descriptor" : "Type", "")}";
-
-            if (_analyzer.ViewExists(viewName))
-                return;
-
-            string primaryKeyName = isDescriptor ? tableName.Replace("Descriptor", "Key") : tableName.Replace("Type", "Key");
-
-            string primaryKeyClause = GetViewKeyDefinition(_schema, tableName, _analyzer.GetPrimaryKeyColumns(tableName)) + " AS [" + primaryKeyName + "]";
-
-            string typeTableName = tableName.Replace("Descriptor", "Type");
-
-            var sb = new StringBuilder();
-
-            sb.Append($"SELECT\n\t{primaryKeyClause}, ");
-
-            if (isDescriptor)
-            {
-                sb.Append(string.Join(",\n\t", _analyzer.GetNonKeyColumns(typeTableName).Select(_ => $"\n\t{ToQualified(_schema, typeTableName, _)}")));
-            }
-            else
-            {
-                sb.Append(string.Join(",\n\t", _analyzer.GetNonKeyColumns(tableName).Select(_ => ToQualified(_schema, tableName, _))));
-            }
-
-            sb.Append($"\nFROM [{_schema}].[{tableName}]");
-
-            if (isDescriptor)
-            {
-                sb.Append($"\n\tJOIN [{_schema}].[{typeTableName}] ON\n\t\t[{_schema}].[{tableName}].[{typeTableName}Id] = [{_schema}].[{typeTableName}].[{typeTableName}Id]");
-            }
-
-            string sql = sb.ToString();
-
-            CreateView(viewName, sql);
         }
 
         private void CreateDimensionView(string tableName)
         {
+            bool asLookup = tableName.EndsWith("Descriptor") || tableName.EndsWith("Type");
+            string schema = asLookup ? _lookupSchema : _viewSchema;
+            string viewName = (asLookup ? "Lkp" : "Dim") + tableName;
+
+            if (_analyzer.ViewExists(schema, viewName))
+                return;
+
             var primaryKeyColumns = _analyzer.GetPrimaryKeyColumns(tableName);
 
-            string primaryKeyColumnName = tableName + "Key";
+            string primaryKeyColumnName = asLookup ? tableName.Replace("Descriptor", "Key").Replace("Type", "Key") : tableName + "Key";
 
-            string primaryKeyClause = GetViewKeyDefinition(_schema, tableName, primaryKeyColumns) + " AS [" + primaryKeyColumnName + "]";
+            string primaryKeyColumnClause = GetSurrogateKeyDefinition(_schema, tableName, primaryKeyColumns) + " AS [" + primaryKeyColumnName + "]";
 
             var relationships = _analyzer.GetForeignKeyRelationships(tableName);
 
-            var foreignKeyClauses = relationships.SelectMany(r => r.RelationshipColumns.Select(c => ToQualified(null, r.PrimaryKeyCorrelationName, c.PrimaryKeyColumn.ColumnName) + " AS [" + c.Column.ColumnName + "]"));
+            var joinClauses = new List<string>();
+
+            var foreignKeyColumnClauses = new List<string>();
+            foreach (var relationship in relationships)
+            {
+                bool processed = false;
+                if (relationship.RelationshipColumns.Count == 1)
+                {
+                    if (!asLookup)
+                    {
+                        var relationshipColumn = relationship.RelationshipColumns[0];
+                        string lookupQualifiedColumnName = ApplyLookupColumnQualifier(relationshipColumn.Column.ColumnName);
+                        if (relationshipColumn.Column.ColumnName != lookupQualifiedColumnName)
+                        {
+                            foreignKeyColumnClauses.Add(ToQualified(null, relationship.PrimaryKeyCorrelationName, relationshipColumn.PrimaryKeyColumn.ColumnName) + " AS [" + lookupQualifiedColumnName + "Key]");
+                            _dimensionDependentTables.Add(relationship.PrimaryKeyTable);
+                            processed = true;
+                        }
+                    }
+                }
+                if (!processed)
+                {
+                    var relatedTableColumns = _analyzer.GetNonKeyColumns(relationship.PrimaryKeyTable);
+                    foreignKeyColumnClauses.AddRange(relatedTableColumns.Select(c 
+                        => ToQualified(null, relationship.PrimaryKeyCorrelationName, c) + " AS [" + relationship.PrimaryKeyCorrelationName + c + "]"));
+                }
+                joinClauses.Add(GetRelationshipJoin(tableName, relationship));
+            }
 
             var viewColumns = new List<string>();
-            viewColumns.Add(primaryKeyClause);
-            viewColumns.AddRange(foreignKeyClauses);
+            viewColumns.Add(primaryKeyColumnClause);
+            viewColumns.AddRange(foreignKeyColumnClauses);
             viewColumns.AddRange(_analyzer.GetNonKeyColumns(tableName).Select(_ => ToQualified(_schema, tableName, _)));
 
             string sql = "SELECT"
                 + string.Join(", ", viewColumns.Select(_ => $"\n\t{_}"))
-                + $"\nFROM [{_schema}].[{tableName}]"
-                + string.Join("", relationships.Select(_ => $"\n{GetRelationshipJoin(tableName, _)}"));
+                + $"\nFROM [{_schema}].[{tableName}]\n"
+                + string.Join("\n", joinClauses);
 
-            string viewName = "Dim" + tableName;
-
-            CreateView(viewName, sql);
+            CreateView(schema, viewName, sql);
             CreateClusteredIndex(viewName, primaryKeyColumnName);
         }
 
@@ -213,23 +207,18 @@ namespace EdFi.DataMartViews
             if (!_analyzer.TableExists(tableName))
                 throw new ArgumentException($"Table {tableName} does not exist.");
 
-            _dependentTables = new HashSet<string>();
+            _factDependentTables = new HashSet<string>();
 
             using (var context = GetContext())
                 CreateFactTableView(tableName);
 
-            foreach (string dependentTable in _dependentTables)
-                ProcessDimension(dependentTable);
-        }
+            _dimensionDependentTables = new HashSet<string>();
 
+            foreach (string factDependentTable in _factDependentTables)
+                CreateDimensionView(factDependentTable);
 
-        //TODO: Multiple dimension tables may be created from a dependent table. See The Assessment dimension for an example
-        private void ProcessDimension(string dependentTable)
-        {
-            if (dependentTable.EndsWith("Descriptor") || dependentTable.EndsWith("Type"))
-                CreateLookupView(dependentTable);
-            else
-                CreateDimensionView(dependentTable);
+            foreach (string dimensionDependentTable in _dimensionDependentTables)
+                CreateDimensionView(dimensionDependentTable);
         }
     }
 }

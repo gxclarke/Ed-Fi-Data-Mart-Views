@@ -138,11 +138,11 @@ namespace EdFi.DataMartViews
             primaryKeyColumns = primaryKeyColumns.OrderBy(_ => dataRows.Select(dr => dr["ReferencedColumnName"]).ToList().IndexOf(_.ColumnName)).ToList();
         }
 
-        public bool ViewExists(string viewName)
+        public bool ViewExists(string viewSchema, string viewName)
         {
             using (var context = GetContext())
             {
-                return context.Views.SingleOrDefault(_ => _.TableSchema == _schema && _.TableName == viewName) != null;
+                return context.Views.SingleOrDefault(_ => _.TableSchema == viewSchema && _.TableName == viewName) != null;
             }
         }
 

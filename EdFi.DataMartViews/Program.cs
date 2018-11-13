@@ -13,7 +13,7 @@ namespace EdFi.DataMartViews
             .AddJsonFile("appsettings.json")
             .Build();
 
-            var builder = new Builder(config["connectionString"], config["schema"], config["dataMartSchemaOwner"]);
+            var builder = new Builder(config["connectionString"], config["dataMartSchemaOwner"], config["schema"], config["lookupSchema"]);
 
             var dataMarts = config.GetSection("dataMarts").GetChildren();
 
