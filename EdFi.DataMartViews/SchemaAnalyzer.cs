@@ -22,6 +22,12 @@ namespace EdFi.DataMartViews
         {
             public string ColumnName { get; set; }
             public string DataType { get; set; }
+
+            public ColumnDefinition(Column column)
+            {
+                ColumnName = column.ColumnName;
+                DataType = column.DataType;
+            }
         }
 
         private SchemaDbContext GetContext()
@@ -29,7 +35,7 @@ namespace EdFi.DataMartViews
             return SqlUtil.GetContext(_connectionString);
         }
 
-        private List<ColumnDefinition> GetColumns(string tableName, string constraintName)
+        private List<ColumnDefinition> GetKeyColumns(string tableName, string constraintName)
         {
             using (var context = GetContext())
             {
@@ -51,11 +57,11 @@ namespace EdFi.DataMartViews
             {
                 var primaryKeyContraint = context.TableConstraints.Single(_ => _.TableSchema == _schema && _.TableName == tableName && _.ConstraintType == "PRIMARY KEY");
 
-                return GetColumns(tableName, primaryKeyContraint.ConstraintName);
+                return GetKeyColumns(tableName, primaryKeyContraint.ConstraintName);
             }
         }
 
-        public List<string> GetNonKeyColumns(string tableName)
+        public List<ColumnDefinition> GetNonKeyColumns(string tableName)
         {
             using (var context = GetContext())
             {
@@ -64,7 +70,7 @@ namespace EdFi.DataMartViews
                     .OrderBy(_ => _.OrdinalPosition)
                     .GroupJoin(context.KeyColumnUsages, c => new { c.TableSchema, c.TableName, c.ColumnName }, kcu => new { kcu.TableSchema, kcu.TableName, kcu.ColumnName }, (c, kcu) => new { Column = c, Count = kcu.Count() })
                     .Where(group => group.Count == 0)
-                    .Select(group => group.Column.ColumnName)
+                    .Select(group => new ColumnDefinition(group.Column))
                     .ToList();
             }
         }
@@ -94,8 +100,8 @@ namespace EdFi.DataMartViews
                     var referentialConstraint = context.ReferentialConstraints.Single(_ => _.ConstraintSchema == foreignKeyConstraint.ConstraintSchema && _.ConstraintName == foreignKeyConstraint.ConstraintName);
                     var primaryKeyConstraint = context.TableConstraints.Single(_ => _.TableSchema == referentialConstraint.UniqueConstraintSchema && _.ConstraintName == referentialConstraint.UniqueConstraintName);
                     
-                    var columns = GetColumns(tableName, referentialConstraint.ConstraintName);
-                    var primaryKeyColumns = GetColumns(primaryKeyConstraint.TableName, primaryKeyConstraint.ConstraintName);
+                    var columns = GetKeyColumns(tableName, referentialConstraint.ConstraintName);
+                    var primaryKeyColumns = GetKeyColumns(primaryKeyConstraint.TableName, primaryKeyConstraint.ConstraintName);
 
                     FixRelationshipColumnOrder(referentialConstraint, ref columns, ref primaryKeyColumns);
 
@@ -104,7 +110,8 @@ namespace EdFi.DataMartViews
                         ConstraintName = foreignKeyConstraint.ConstraintName,
                         PrimaryKeyTable = primaryKeyConstraint.TableName,
                         PrimaryKeyCorrelationName = GetConventionBasedCorrelationName(foreignKeyConstraint.ConstraintName),
-                        RelationshipColumns = columns.Zip(primaryKeyColumns, (c, pkc) => new ForeignKeyColumn {  Column = c, PrimaryKeyColumn = pkc }).ToList()
+                        RelationshipColumns = columns.Zip(primaryKeyColumns, (c, pkc) => new ForeignKeyColumn {  Column = c, PrimaryKeyColumn = pkc }).ToList(),
+
                     });
                 }
             }

@@ -20,7 +20,7 @@ namespace EdFi.DataMartViews
         {
             _connectionString = connectionString;
             _schema = schema;
-             _viewSchema = viewSchema;
+            _viewSchema = viewSchema;
             _lookupSchema = lookupSchema ?? viewSchema;
 
             _analyzer = new SchemaAnalyzer(connectionString, schema);
@@ -58,7 +58,7 @@ namespace EdFi.DataMartViews
             var joinClauses = relationship.RelationshipColumns.Select(_ => 
                 $"{ToQualified(_schema, tableName, _.Column.ColumnName)} = {ToQualified(null, relationship.PrimaryKeyCorrelationName, _.PrimaryKeyColumn.ColumnName)}");
 
-            return $"\tLEFT JOIN {ToQualified(_schema, relationship.PrimaryKeyTable)} AS [{relationship.PrimaryKeyCorrelationName}] ON\n\t\t{string.Join(" AND\n\t\t", joinClauses)}";
+            return $"\tLEFT JOIN {ToQualified(_schema, relationship.PrimaryKeyTable)} AS [{relationship.PrimaryKeyCorrelationName}]\n\t\tON {string.Join(" AND\n\t\t", joinClauses)}";
         }
 
         private string GetConventionBasedRelationshipName(SchemaAnalyzer.ForeignKeyRelationship relationship)
@@ -129,7 +129,7 @@ namespace EdFi.DataMartViews
             var viewColumns = new List<string>();
             viewColumns.Add(primaryKeyColumnClause);
             viewColumns.AddRange(foreignKeyColumnClauses);
-            viewColumns.AddRange(_analyzer.GetNonKeyColumns(tableName).Select(_ => ToQualified(_schema, tableName, _)));
+            viewColumns.AddRange(_analyzer.GetNonKeyColumns(tableName).Select(_ => ToQualified(_schema, tableName, _.ColumnName)));
 
             string sql = "SELECT"
                 + string.Join(", ", viewColumns.Select(_ => $"\n\t{_}"))
@@ -183,7 +183,7 @@ namespace EdFi.DataMartViews
                 {
                     var relatedTableColumns = _analyzer.GetNonKeyColumns(relationship.PrimaryKeyTable);
                     foreignKeyColumnClauses.AddRange(relatedTableColumns.Select(c 
-                        => ToQualified(null, relationship.PrimaryKeyCorrelationName, c) + " AS [" + relationship.PrimaryKeyCorrelationName + c + "]"));
+                        => ToQualified(null, relationship.PrimaryKeyCorrelationName, c.ColumnName) + " AS [" + relationship.PrimaryKeyCorrelationName + c + "]"));
                 }
                 joinClauses.Add(GetRelationshipJoin(tableName, relationship));
             }
@@ -191,7 +191,7 @@ namespace EdFi.DataMartViews
             var viewColumns = new List<string>();
             viewColumns.Add(primaryKeyColumnClause);
             viewColumns.AddRange(foreignKeyColumnClauses);
-            viewColumns.AddRange(_analyzer.GetNonKeyColumns(tableName).Select(_ => ToQualified(_schema, tableName, _)));
+            viewColumns.AddRange(_analyzer.GetNonKeyColumns(tableName).Select(_ => ToQualified(_schema, tableName, _.ColumnName)));
 
             string sql = "SELECT"
                 + string.Join(", ", viewColumns.Select(_ => $"\n\t{_}"))
@@ -209,8 +209,7 @@ namespace EdFi.DataMartViews
 
             _factDependentTables = new HashSet<string>();
 
-            using (var context = GetContext())
-                CreateFactTableView(tableName);
+            //CreateFactTableView(tab, leName);
 
             _dimensionDependentTables = new HashSet<string>();
 
@@ -219,6 +218,57 @@ namespace EdFi.DataMartViews
 
             foreach (string dimensionDependentTable in _dimensionDependentTables)
                 CreateDimensionView(dimensionDependentTable);
+        }
+
+        public void CreateView(string tableName, ViewDefinition viewDefinition)
+        {
+            var columnClauses = new List<string>();
+            var joinClauses = new List<string>();
+
+            foreach(var columnGroup in viewDefinition.ColumnGroups)
+            {
+                if (columnGroup is ViewDefinition.PrimaryKey)
+                {
+                    columnClauses.Add(GetSurrogateKeyDefinition(_schema, tableName, columnGroup.Columns) + " AS [" + tableName + "Key]");
+                }
+                else
+                if (columnGroup is ViewDefinition.ReferenceKey)
+                {
+                    var referenceKey = columnGroup as ViewDefinition.ReferenceKey;
+                    var relationship = referenceKey.Relationship;
+                    if (referenceKey.KeyType == ViewDefinition.ReferenceKeyType.LookupReference)
+                    {
+                        var relationshipColumn = relationship.RelationshipColumns[0];
+                        string lookupKey = ApplyLookupColumnQualifier(relationshipColumn.Column.ColumnName) + "Key";
+                        columnClauses.Add(ToQualified(null, relationship.PrimaryKeyCorrelationName, relationshipColumn.PrimaryKeyColumn.ColumnName) + " AS [" + lookupKey + "]");
+                    }
+                    else if (referenceKey.KeyType == ViewDefinition.ReferenceKeyType.Denormalized)
+                    {
+                        columnClauses.AddRange(relationship.RelationshipColumns.Select(c => ToQualified(null, relationship.PrimaryKeyCorrelationName, c.Column.ColumnName) + " AS [" + c.Column.ColumnName + "]"));
+                    }
+                    else
+                    {
+                        columnClauses.Add(GetSurrogateKeyDefinition(_schema, tableName, relationship.RelationshipColumns.Select(rc => rc.Column)) + " AS [" + relationship.PrimaryKeyCorrelationName + "Key]");
+
+                    }
+                    joinClauses.Add(GetRelationshipJoin(tableName, referenceKey.Relationship));
+                }
+                else
+                {
+                    columnClauses.AddRange(columnGroup.Columns.Select(_ => ToQualified(_schema, tableName, _.ColumnName)));
+                }
+            }
+
+            string sql = "SELECT"
+                + string.Join(", ", columnClauses.Select(_ => $"\n\t{_}"))
+                + $"\nFROM [{_schema}].[{tableName}]\n"
+                + string.Join("\n", joinClauses);
+
+            var viewSchema = viewDefinition.Type == ViewType.Lookup ? _lookupSchema : _viewSchema;
+            var viewPrefix = viewDefinition.Type == ViewType.Lookup ? "Lkp" : (viewDefinition.Type == ViewType.Dimension ? "Dim" : "Fact");
+
+            string statement = $"CREATE VIEW {ToQualified(viewSchema, viewPrefix + tableName)} WITH SCHEMABINDING AS\n{sql};";
+            SqlUtil.ExecuteCommand(_connectionString, statement);
         }
     }
 }
